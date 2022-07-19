@@ -9,12 +9,13 @@ class Log:
         self.log_each = log_each
         self.epoch = initial_epoch
 
-    def train(self, len_dataset: int) -> None:
+    def train(self, len_dataset: int, rank: int) -> None:
         self.epoch += 1
-        if self.epoch == 0:
-            self._print_header()
-        else:
-            self.flush()
+        if rank in [-1, 0]:
+            if self.epoch == 0:
+                self._print_header()
+            else:
+                self.flush()
 
         self.is_train = True
         self.last_steps_state = {"loss": 0.0, "accuracy": 0.0, "steps": 0}

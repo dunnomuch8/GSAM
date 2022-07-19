@@ -7,7 +7,7 @@ from utility.cutout import Cutout
 
 
 class Cifar:
-    def __init__(self, batch_size, threads):
+    def __init__(self, batch_size, threads, sampler=False):
         mean, std = self._get_statistics()
 
         train_transform = transforms.Compose([
@@ -25,8 +25,9 @@ class Cifar:
 
         train_set = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
         test_set = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=test_transform)
+        self.train_sampler = torch.utils.data.distributed.DistributedSampler(train_set) if sampler else None
 
-        self.train = torch.utils.data.DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=threads, pin_memory=True)
+        self.train = torch.utils.data.DataLoader(train_set, batch_size=batch_size, shuffle=not sampler, num_workers=threads, pin_memory=True, sampler=self.train_sampler)
         self.test = torch.utils.data.DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=threads, pin_memory=True)
 
         self.classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')

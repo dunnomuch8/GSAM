@@ -13,6 +13,11 @@ import sys; sys.path.append("..")
 from sam import SAM
 from gsam import GSAM, LinearScheduler, CosineScheduler, ProportionScheduler
 
+# DDP
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -30,16 +35,49 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", default=0.4, type=int, help="Rho parameter for SAM.")
     parser.add_argument("--weight_decay", default=0.0005, type=float, help="L2 weight decay.")
     parser.add_argument("--width_factor", default=8, type=int, help="How many times wider compared to normal ResNet.")
+    parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+
     args = parser.parse_args()
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # Set DDP variables====================================================
+    args.total_batch_size = args.batch_size
+    args.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
+    args.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
+
+    # DDP mode
+    cuda = torch.cuda.is_available()
+    if args.local_rank != -1:
+        assert torch.cuda.device_count() > args.local_rank
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device('cuda', args.local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
+        assert args.batch_size % args.world_size == 0, '--batch-size must be multiple of CUDA device count'
+        args.batch_size = args.total_batch_size // args.world_size
+    rank = args.global_rank
+    # =====================================================================
 
     initialize(args, seed=42)
     #device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    dataset = Cifar(args.batch_size, args.threads)
+    dataset = Cifar(args.batch_size, args.threads, sampler=rank!=-1)  # not sure bout rank
+
     log = Log(log_each=10)
-    model = WideResNet(args.depth, args.width_factor, args.dropout, in_channels=3, labels=10).cuda()#to(device)
+    model = WideResNet(args.depth, args.width_factor, args.dropout, in_channels=3, labels=10).to(device)#.cuda()
     #model = torch.nn.DataParallel(model)
 
+    # Set DDP variables====================================================
+    # SyncBatchNorm
+    if cuda and rank != -1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+        # logger.info('Using SyncBatchNorm()')
+
+    # DDP mode
+    if cuda and rank != -1:
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+
+    # Dataloader
+    # =====================================================================
     '''
     base_optimizer = torch.optim.SGD
     optimizer = SAM(model.parameters(), base_optimizer, rho=args.rho, adaptive=args.adaptive, lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
@@ -56,8 +94,11 @@ if __name__ == "__main__":
     
     optimizer = GSAM(params=model.parameters(), base_optimizer=base_optimizer, model=model, gsam_alpha=args.alpha, rho_scheduler=rho_scheduler, adaptive=args.adaptive)
     for epoch in range(args.epochs):
+        if rank != -1:
+            dataset.train_sampler.set_epoch(epoch)
+
         model.train()
-        log.train(len_dataset=len(dataset.train))
+        log.train(len_dataset=len(dataset.train), rank=rank)
 
         for batch in dataset.train:
             inputs, targets = (b.cuda() for b in batch)
@@ -81,21 +122,23 @@ if __name__ == "__main__":
             predictions, loss = optimizer.step()
     
             with torch.no_grad():
-                correct = torch.argmax(predictions.data, 1) == targets
-                log(model, loss.cpu().repeat(args.batch_size), correct.cpu(), scheduler.lr())
+                if rank in [-1, 0]:
+                    correct = torch.argmax(predictions.data, 1) == targets
+                    log(model, loss.cpu().repeat(args.batch_size), correct.cpu(), scheduler.lr())
                 scheduler.step()
                 optimizer.update_rho_t()
 
-        model.eval()
-        log.eval(len_dataset=len(dataset.test))
 
-        with torch.no_grad():
-            for batch in dataset.test:
-                inputs, targets = (b.cuda() for b in batch)
+        if rank in [-1, 0]:
+            model.eval()
+            log.eval(len_dataset=len(dataset.test))
+            with torch.no_grad():
+                for batch in dataset.test:
+                    inputs, targets = (b.cuda() for b in batch)
 
-                predictions = model(inputs)
-                loss = smooth_crossentropy(predictions, targets)
-                correct = torch.argmax(predictions, 1) == targets
-                log(model, loss.cpu(), correct.cpu())
+                    predictions = model(inputs)
+                    loss = smooth_crossentropy(predictions, targets)
+                    correct = torch.argmax(predictions, 1) == targets
+                    log(model, loss.cpu(), correct.cpu())
 
-    log.flush()
+    if rank in [-1, 0]: log.flush()
