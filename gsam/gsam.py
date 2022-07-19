@@ -46,18 +46,18 @@ class GSAM(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None: continue
                 self.state[p]["old_g"] = p.grad.data.clone()
+                self.state[p]["old_p"] = p.data.clone()
                 e_w = p.grad * scale.to(p)
                 if self.adaptive:
                     e_w *= torch.pow(p, 2)
                 p.add_(e_w)  # climb to the local maximum "w + e(w)"
-                self.state[p]['e_w'] = e_w
                 
     @torch.no_grad()
     def unperturb(self):
         for group in self.param_groups:
             for p in group['params']:
-                if 'e_w' in self.state[p].keys():
-                    p.data.sub_(self.state[p]['e_w'])
+                if p.grad is None: continue
+                p.data = self.state[p]["old_p"]  # get back to "w" from "w + e(w)"
 
     @torch.no_grad()
     def gradient_decompose(self, alpha=0.0):
