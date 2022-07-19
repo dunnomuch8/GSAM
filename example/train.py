@@ -36,6 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", default=0.0005, type=float, help="L2 weight decay.")
     parser.add_argument("--width_factor", default=8, type=int, help="How many times wider compared to normal ResNet.")
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
+    parser.add_argument('--noamp', action='store_true', help='NOT using AMP')
 
     args = parser.parse_args()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -76,8 +77,9 @@ if __name__ == "__main__":
     if cuda and rank != -1:
         model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
 
-    # Dataloader
-    # =====================================================================
+    # AMP
+    amp_kwargs = {'enabled': not args.noamp, 'growth_interval': 4000}
+
     '''
     base_optimizer = torch.optim.SGD
     optimizer = SAM(model.parameters(), base_optimizer, rho=args.rho, adaptive=args.adaptive, lr=args.learning_rate, momentum=args.momentum, weight_decay=args.weight_decay)
@@ -91,8 +93,9 @@ if __name__ == "__main__":
     scheduler = CosineScheduler(T_max=args.epochs*len(dataset.train), max_value=args.learning_rate, min_value=0.0, optimizer=base_optimizer)
     rho_scheduler = ProportionScheduler(pytorch_lr_scheduler=scheduler, max_lr=args.learning_rate, min_lr=0.0,
  max_value=args.rho_max, min_value=args.rho_min)
-    
-    optimizer = GSAM(params=model.parameters(), base_optimizer=base_optimizer, model=model, gsam_alpha=args.alpha, rho_scheduler=rho_scheduler, adaptive=args.adaptive)
+
+    optimizer = GSAM(amp_kwargs=amp_kwargs, max_grad_norm=5000, params=model.parameters(), base_optimizer=base_optimizer, model=model, gsam_alpha=args.alpha, rho_scheduler=rho_scheduler, adaptive=args.adaptive)
+
     for epoch in range(args.epochs):
         if rank != -1:
             dataset.train_sampler.set_epoch(epoch)

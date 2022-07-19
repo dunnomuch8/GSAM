@@ -4,7 +4,9 @@ import contextlib
 from torch.distributed import ReduceOp
 
 class GSAM(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer, model, gsam_alpha, rho_scheduler, adaptive=False, perturb_eps=1e-12, grad_reduce='mean', **kwargs):
+    def __init__(self, params, base_optimizer, model, gsam_alpha, rho_scheduler, adaptive=False, perturb_eps=1e-12, grad_reduce='mean',
+                amp_kwargs=False, max_grad_norm=-1, **kwargs):
+
         defaults = dict(adaptive=adaptive, **kwargs)
         super(GSAM, self).__init__(params, defaults)
         self.model = model
@@ -14,10 +16,13 @@ class GSAM(torch.optim.Optimizer):
         self.rho_scheduler = rho_scheduler
         self.perturb_eps = perturb_eps
         self.alpha = gsam_alpha
-        
+
+        self.scaler = torch.cuda.amp.GradScaler(**amp_kwargs)
+        self.max_grad_norm = max_grad_norm
+
         # initialize self.rho_t
         self.update_rho_t()
-        
+
         # set up reduction for gradient across workers
         if grad_reduce.lower() == 'mean':
             if hasattr(ReduceOp, 'AVG'):
@@ -31,7 +36,7 @@ class GSAM(torch.optim.Optimizer):
             self.manual_average = False
         else:
             raise ValueError('"grad_reduce" should be one of ["mean", "sum"].')
-    
+
     @torch.no_grad()
     def update_rho_t(self):
         self.rho_t = self.rho_scheduler.step()
@@ -51,7 +56,7 @@ class GSAM(torch.optim.Optimizer):
                 if self.adaptive:
                     e_w *= torch.pow(p, 2)
                 p.add_(e_w)  # climb to the local maximum "w + e(w)"
-                
+
     @torch.no_grad()
     def unperturb(self):
         for group in self.param_groups:
@@ -96,6 +101,10 @@ class GSAM(torch.optim.Optimizer):
                         p.grad.div_(float(world_size))
                     else:
                         torch.distributed.all_reduce(p.grad, op=self.grad_reduce)
+            # required
+            if self.scaler.is_enabled():
+                torch.distributed.all_reduce(list(self.scaler._per_optimizer_states[id(self.base_optimizer)]["found_inf_per_device"].values())[0], op=self.grad_reduce)
+            # if prnt and list(self.scaler._per_optimizer_states[id(self.base_optimizer)]["found_inf_per_device"].values())[0]:print("found_inf")
         return
 
     @torch.no_grad()
@@ -124,7 +133,7 @@ class GSAM(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.base_optimizer.param_groups = self.param_groups
-        
+
     def maybe_no_sync(self):
         if torch.distributed.is_initialized():
             return self.model.no_sync()
@@ -141,10 +150,15 @@ class GSAM(torch.optim.Optimizer):
         def get_grad():
             self.base_optimizer.zero_grad()
             with torch.enable_grad():
-                outputs = self.model(inputs)
-                loss = loss_fn(outputs, targets, **kwargs)
+                with torch.cuda.amp.autocast(enabled=self.scaler.is_enabled()):
+                    outputs = self.model(inputs)
+                    loss = loss_fn(outputs, targets, **kwargs)
+
+                # Note that if amp is not True scaler will return the loss unchanged
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.base_optimizer)
+
             loss_value = loss.data.clone().detach()
-            loss.backward()
             return outputs, loss_value
 
         self.forward_backward_func = get_grad
@@ -160,6 +174,7 @@ class GSAM(torch.optim.Optimizer):
         with self.maybe_no_sync():
             # get gradient
             outputs, loss_value = get_grad()
+            if self.scaler.is_enabled(): self.scaler._per_optimizer_states[id(self.base_optimizer)] = {"stage": 0, "found_inf_per_device": {}}
 
             # perturb weights
             self.perturb_weights(rho=self.rho_t)
@@ -175,12 +190,19 @@ class GSAM(torch.optim.Optimizer):
 
             # unperturb
             self.unperturb()
-            
+
         # synchronize gradients across workers
-        self._sync_grad()    
+        self._sync_grad()
+
+        if self.max_grad_norm != -1:
+            # self.scaler.unscale_(self.base_optimizer)
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
         # update with new directions
-        self.base_optimizer.step()
+
+        # note that if amp is False, this is equivelant to self.base_optimzier.step()
+        self.scaler.step(self.base_optimizer)
+        self.scaler.update()
 
         # enable running stats
         enable_running_stats(self.model)
